@@ -1,0 +1,165 @@
+version: "3.3"
+services:
+
+  msgateway_fs:
+
+    # This service is basically a config server - the other services are
+    # configured by the files served here via a named volume and are
+    # largely generic.
+
+    image: oneacrefund/msgateway-fs:${MSGATEWAY_VERSION:-build}
+    volumes:
+      - msgateway_fs_config:/etc/msgateway-fs
+    environment:
+      # Where stuff is
+      - BUCKET_SERVER=http://cluster_seed:9091
+      - GATEWAY_API=${GATEWAY_API:-https://gateway:4985}
+      - ROSTER_API=${ROSTER_API:?-ROSTER_API}
+      # Access control
+      - CLUSTER_ADMINISTRATOR_PASSWORD=${GATEWAY_ADMIN_PASSWORD:?GATEWAY_ADMIN_PASSWORD}
+      - BUCKET_USER_PASSWORD_bucket_user=${GATEWAY_ADMIN_PASSWORD}
+      - GATEWAY_USER_PASSWORD_sync_daemon_user=${GATEWAY_ADMIN_PASSWORD}
+      - MSGATEWAY_ADMINISTRATOR_PASSWORD=${GATEWAY_ADMIN_PASSWORD}
+      # HTTPS & CORS - DRAGONS DRAGONS THERE *MUST* be spaces in JSON array - sync gateway is dumb!
+      - CORS_ORIGIN=${CORS_ORIGINS?CORS safe origin urls required as JSON array, i.e. '["http://localhost:4000", "https://fieldforce-419be.firebaseapp.com"]' (CORS_ORIGINS).}
+      - CORS_LOGINORIGIN=${CORS_ORIGINS}
+      - UNSAFE_HTTPS=${UNSAFE_HTTPS:-true} # This is for *internal* connections, so is fine
+      # Secret files - try to minimize these
+      - MSGATEWAY_FS_SECRETS_KEY=${MSGATEWAY_FS_SECRETS_KEY}
+      - MSGATEWAY_FS_SECRETS_FILE_HTTPS_CRT=${MSGATEWAY_FS_SECRETS_FILE_HTTPS_CRT}
+      - MSGATEWAY_FS_SECRETS_FILE_HTTPS_KEY=${MSGATEWAY_FS_SECRETS_FILE_HTTPS_KEY}
+      # Sizing
+      - CLUSTER_RAMSIZE=${CLUSTER_RAMSIZE:-1024}
+      - CLUSTER_INDEX_RAMSIZE=${CLUSTER_INDEX_RAMSIZE:-512}
+      - BUCKET_RAMSIZE_fs_bucket_v0=${BUCKET_RAMSIZE_fs_bucket_v0:-512}
+      # Performance
+      - MSGATEWAY_ACTION_CONCURRENCY=${MSGATEWAY_ACTION_CONCURRENCY}
+      # Logging
+      - MSGATEWAY_LOG_LEVELS=${MSGATEWAY_LOG_LEVELS-[]}
+      - GATEWAY_LOG_LEVEL=${GATEWAY_LOG_LEVEL-info}
+      - GATEWAY_LOG_KEYS=${GATEWAY_LOG_KEYS:-["HTTP"]}
+      # Debugging
+      - MSGATEWAY_CHANNEL_POLL_INTERVAL=${MSGATEWAY_CHANNEL_POLL_INTERVAL}
+      - MSGATEWAY_STATS_POLL_INTERVAL=${MSGATEWAY_STATS_POLL_INTERVAL}
+      - MSGATEWAY_STATS_POLL_GC=${MSGATEWAY_STATS_POLL_GC}
+      - MSGATEWAY_HEAP_DUMP_FILE_PREFIX=${MSGATEWAY_HEAP_DUMP_FILE_PREFIX}
+    logging: &sharedLogging
+      driver: json-file
+      options:
+        # Extra metadata for better log mgmt
+        # tag: "{{.ImageName}}/{{.Name}}/{{.ID}}"
+        tag: "{{.ImageName}}/{{.Name}}"
+        # DRAGONS - by default, logging is blocking - we should drop log messages vs hang
+        mode: non-blocking
+
+  cluster_seed:
+
+    # A couchbase cluster of one node
+    # Configured with initial buckets and sizes via an .env file
+    # TODO: Something nicer here
+
+    image: oneacrefund/cluster:${MSGATEWAY_VERSION:-build}
+    volumes:
+      - cluster_data:/opt/couchbase/var
+      - cluster_logs:/opt/couchbase/var/lib/couchbase/logs
+      - msgateway_fs_config:/etc/msgateway-fs
+    environment:
+      - CLUSTER_CONFIG_FILE=/etc/msgateway-fs/cluster-config.env
+      # Couchbase is really bad at telling us when it's initialized
+      # so we manually expose a port when we're sure
+      - CLUSTER_READY_PORT=9092
+    ports:
+      # Expose only to localhost on the docker host, for debugging
+      - 127.0.0.1:8091:8091
+      - 127.0.0.1:8092:8092
+      - 127.0.0.1:8093:8093
+      - 127.0.0.1:8094:8094
+      - 127.0.0.1:9091:9091
+      - 127.0.0.1:9092:9092
+      - 127.0.0.1:11210:11210
+    logging:
+      <<: *sharedLogging
+
+  cluster_stats:
+
+    # Stats 'sidecar' for the cluster_seed - makes it easy to see logs
+    # separately
+
+    image: alpine:3.8
+    volumes:
+      - cluster_logs:/var/lib/couchbase/logs
+    command: tail -F /var/lib/couchbase/logs/stats.log
+    logging:
+      <<: *sharedLogging
+
+  gateway:
+
+    # A couchbase sync gateway instance
+    # Configured with sync function and settings via a .json file
+
+    image: oneacrefund/gateway:${MSGATEWAY_VERSION:-build}
+    volumes:
+      - msgateway_fs_config:/etc/msgateway-fs
+      - certificate_files:/etc/certificates
+    environment:
+      - GATEWAY_CONFIG_FILE=/etc/msgateway-fs/gateway-config.json
+      - HTTPS_READY_FILE=/etc/certificates/key.pem
+      - CLUSTER_READY_HOST=cluster_seed:9092
+      - LOG_AWK_FILTER=${GATEWAY_LOG_AWK_FILTER}
+    ports:
+      # Expose to the world - careful!
+      - 4984:4984
+      - 127.0.0.1:4985:4985
+    logging:
+      <<: *sharedLogging
+
+  msgateway:
+
+    # A mobile sync gateway instance
+    # Configured with dataset and other settings via a .json file
+
+    image: oneacrefund/msgateway:${MSGATEWAY_VERSION:-build}
+    volumes:
+      - msgateway_fs_config:/etc/msgateway-fs
+      - certificate_files:/etc/certificates
+    environment:
+      - MSGATEWAY_CONFIG_FILE=/etc/msgateway-fs/msgateway-config.json
+      - HTTPS_READY_FILE=/etc/certificates/key.pem
+    ports:
+      - 3000:3000
+    logging:
+      <<: *sharedLogging
+
+  certificates:
+
+    # Service that creates/unpacks https certificates for other services
+    # The certificates are then shared on a named volume.
+
+    image: oneacrefund/certificates:${MSGATEWAY_VERSION:-build}
+    volumes:
+      # Also add a volume from the docker host itself in case we want to pull in
+      # certificates we get from anywhere else
+      - /etc/docker-host:/etc/docker-host
+      - certificate_files:/etc/certificates
+      - letsencrypt_data:/etc/letsencrypt
+      - letsencrypt_logs:/var/lib/letsencrypt
+    environment:
+      # By default, this generates a self-signed certificate at this location
+      - HTTPS_CERT_FILE_GATEWAY=${HTTPS_CERT_FILE:-/etc/certificates/cert.crt}
+      - HTTPS_KEY_FILE_GATEWAY=${HTTPS_KEY_FILE:-/etc/certificates/key.pem}
+      # Other options are to use a domain+email for certbot
+      - HTTPS_CERTBOT_DOMAIN_GATEWAY=${HTTPS_CERTBOT_DOMAIN}
+      - HTTPS_CERTBOT_EMAIL_GATEWAY=${HTTPS_CERTBOT_EMAIL:-devs@oneacrefund.org}
+    ports:
+      # Expose for certbot
+      - 80:80
+    logging:
+      <<: *sharedLogging
+
+volumes:
+  msgateway_fs_config:
+  cluster_data:
+  cluster_logs:
+  certificate_files:
+  letsencrypt_data:
+  letsencrypt_logs:
